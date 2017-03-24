@@ -50,11 +50,6 @@ static int devfreq_simple_ondemand_func(struct devfreq *df,
 		stat.total_time >>= 7;
 	}
 
-	if (!is_display_on()) {
-		*freq = 133000000;
-		return 0;
-	}
-
 	if (data && data->simple_scaling) {
 		if (stat.busy_time * 100 >
 		    stat.total_time * dfso_upthreshold)
