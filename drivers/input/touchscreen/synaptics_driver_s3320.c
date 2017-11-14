@@ -312,6 +312,9 @@ static int F54_ANALOG_DATA_BASE;//0x00
 static int synaptics_i2c_suspend(struct device *dev);
 static int synaptics_i2c_resume(struct device *dev);
 /**************I2C resume && suspend end*********/
+static void speedup_synaptics_resume(struct work_struct *work);
+static int synaptics_ts_resume(struct device *dev);
+static int synaptics_ts_suspend(struct device *dev);
 static int synaptics_ts_remove(struct i2c_client *client);
 static int synaptics_ts_probe(struct i2c_client *client, const struct i2c_device_id *id);
 static ssize_t synaptics_rmi4_baseline_show(struct device *dev, char *buf, bool savefile)	;
@@ -453,6 +456,7 @@ struct synaptics_ts_data {
 	uint32_t pre_btn_state;
 	struct delayed_work  base_work;
 	struct work_struct base_work_intr;
+	struct delayed_work speed_up_work;
 	struct input_dev *input_dev;
 	struct hrtimer timer;
 #if defined(CONFIG_FB)
@@ -464,7 +468,6 @@ struct synaptics_ts_data {
 	int glove_enable;
     int changer_connet;
 	int is_suspended;
-    atomic_t is_stop;
     spinlock_t lock;
 
 	/********test*******/
@@ -1428,7 +1431,7 @@ uint8_t int_touch(void)
 	input_sync(ts->input_dev);
 
 #ifdef SUPPORT_GESTURE
-	if (ts->in_gesture_mode == 1 && ts->screen_off == 1) {
+	if (ts->in_gesture_mode == 1 && ts->is_suspended == 1) {
 		gesture_judge(ts);
 	}
 #endif
@@ -1472,7 +1475,7 @@ static void synaptics_ts_work_func(struct work_struct *work)
 		if (status_check < 0) {
 			TPD_ERR("synaptics_init_panel failed\n");
 		}
-		if ((ts->screen_off == 1) && (ts->gesture_enable == 1)){
+		if ((ts->is_suspended == 1) && (ts->gesture_enable == 1)){
 			synaptics_enable_interrupt_for_gesture(ts, 1);
 		}
 	}
@@ -1505,15 +1508,13 @@ static enum hrtimer_restart synaptics_ts_timer_func(struct hrtimer *timer)
 #else
 static irqreturn_t synaptics_irq_thread_fn(int irq, void *dev_id)
 {
-	struct synaptics_ts_data *ts = (struct synaptics_ts_data *)dev_id;
-	int ret,status_check;
-	uint8_t status = 0;
-	uint8_t inte = 0;
+	struct synaptics_ts_data *ts = dev_id;
+	uint32_t status;
+	int ret;
 
-	if (atomic_read(&ts->is_stop) == 1)
-	{
-		return IRQ_HANDLED;
-	}
+	if (ts->is_suspended) {
+		unsigned long flags;
+		bool i2c_active;
 
 	if( ts->enable_remote) {
 		return IRQ_HANDLED;
@@ -1529,27 +1530,20 @@ static irqreturn_t synaptics_irq_thread_fn(int irq, void *dev_id)
         synaptics_hard_reset(ts);
 		return IRQ_HANDLED;
 	}
-	status = ret & 0xff;
-	inte = (ret & 0x7f00)>>8;
-	//TPD_ERR("%s status[0x%x],inte[0x%x]\n",__func__,status,inte);
-        if(status & 0x80){
+
+	status = ret;
+
+	if (status & 0x80) {
 		TPD_DEBUG("enter reset tp status,and ts->in_gesture_mode is:%d\n",ts->in_gesture_mode);
-		status_check = synaptics_init_panel(ts);
-		if (status_check < 0) {
+		ret = synaptics_init_panel(ts);
+		if (ret < 0)
 			TPD_ERR("synaptics_init_panel failed\n");
-		}
-		if ((ts->is_suspended == 1) && (ts->gesture_enable == 1)){
+
+		if (ts->is_suspended && ts->gesture_enable)
 			synaptics_enable_interrupt_for_gesture(ts, 1);
-		}
 	}
-/*
-	if(0 != status && 1 != status) {//0:no error;1: after hard reset;the two state don't need soft reset
-        TPD_ERR("%s status[0x%x],inte[0x%x]\n",__func__,status,inte);
-		int_state(ts);
-		goto END;
-	}
-*/
-	if (inte & 0x04) {
+
+	if (status & 0x400) {
 		uint8_t finger_num = int_touch();
 
 		/* All fingers up; do get base once */
@@ -1613,7 +1607,7 @@ static ssize_t tp_gesture_write_func(struct file *file, const char __user *buffe
 	struct synaptics_ts_data *ts = ts_g;
 	if(!ts)
 		return count;
-	if( count > 2 || ts->screen_off)
+	if( count > 2 || ts->is_suspended)
 		return count;
 	if( copy_from_user(buf, buffer, count) ){
 		TPD_ERR(KERN_INFO "%s: read proc input error.\n", __func__);
@@ -1683,16 +1677,16 @@ static ssize_t gesture_switch_write_func(struct file *file, const char __user *p
 	}
 	ret = sscanf(buf,"%d",&write_flag);
 	gesture_switch = write_flag;
-	TPD_ERR("gesture_switch:%d,suspend:%d,gesture:%d\n",gesture_switch,ts->screen_off,ts->gesture_enable);
+	TPD_ERR("gesture_switch:%d,suspend:%d,gesture:%d\n",gesture_switch,ts->is_suspended,ts->gesture_enable);
 	if (1 == gesture_switch){
-		if ((ts->screen_off == 1) && (ts->gesture_enable == 1)){
+		if ((ts->is_suspended == 1) && (ts->gesture_enable == 1)){
 			i2c_smbus_write_byte_data(ts->client, 0xff, 0x0);
 			synaptics_mode_change(0x80);
 			//touch_enable(ts);
 			synaptics_enable_interrupt_for_gesture(ts, 1);
 		}
 	}else if(2 == gesture_switch){
-		if ((ts->screen_off == 1) && (ts->gesture_enable == 1)){
+		if ((ts->is_suspended == 1) && (ts->gesture_enable == 1)){
 			i2c_smbus_write_byte_data(ts->client, 0xff, 0x0);
 			synaptics_mode_change(0x81);
 			//touch_disable(ts);
@@ -2391,7 +2385,7 @@ static ssize_t tp_baseline_show_with_cbc(struct device_driver *ddri, char *buf)
 	uint8_t tmp_old, tmp_new;
 	uint16_t count = 0;
 	struct synaptics_ts_data *ts = ts_g;
-	if(ts->screen_off == 1)
+	if(ts->is_suspended == 1)
 		return count;
 	memset(delta_baseline,0,sizeof(delta_baseline));
 	if(!ts)
@@ -2679,7 +2673,7 @@ static ssize_t synaptics_update_fw_store(struct device *dev,
 	unsigned long val;
 	int rc;
 
-	if (ts->screen_off && ts->support_hw_poweroff){
+	if (ts->is_suspended && ts->support_hw_poweroff){
 		TPD_ERR("power off firmware abort!\n");
 		return size;
 	}
@@ -3986,22 +3980,16 @@ err_pinctrl_get:
 
 static void synaptics_suspend_resume(struct work_struct *work)
 {
-	struct synaptics_ts_data *ts = container_of(work, typeof(*ts), pm_work);
+	struct synaptics_ts_data *ts =
+		container_of(work, typeof(*ts), pm_work);
 
 	if (ts->is_suspended) {
-		atomic_set(&ts->is_stop, 1);
 		if (!ts->gesture_enable)
 			touch_disable(ts);
-			if (ts->support_hw_poweroff) {
-				tpd_power(ts, 0);
-				pinctrl_select_state(ts->pinctrl,
-					ts->pinctrl_state_suspend);
-			}
-		}
+		synaptics_ts_suspend(&ts->client->dev);
 	} else {
-		if (ts->gesture_enable) {
+		if (ts->gesture_enable)
 			synaptics_enable_interrupt_for_gesture(ts, false);
-		atomic_set(&ts->is_stop, 0);
 		touch_enable(ts);
 		synaptics_ts_resume(&ts->client->dev);
 	}
@@ -4037,21 +4025,20 @@ static int synaptics_ts_probe(struct i2c_client *client, const struct i2c_device
 	synaptics_parse_dts(&client->dev, ts);
 
 	/***power_init*****/
-	ret = synaptics_dsx_pinctrl_init(ts);
-	if (ret < 0)
-		goto err_alloc_data_failed;
-        else
-		pinctrl_select_state(ts->pinctrl, ts->pinctrl_state_active);
 	ret = tpd_power(ts, 1);
 	if( ret < 0 )
 		TPD_ERR("regulator_enable is called\n");
+    ret = synaptics_dsx_pinctrl_init(ts);
+    if (!ret && ts->pinctrl) {
+        ret = pinctrl_select_state(ts->pinctrl,
+                ts->pinctrl_state_active);
+        }
     msleep(100);//after power on tp need sometime from bootloader to ui mode
 	mutex_init(&ts->mutex);
 	mutex_init(&ts->mutexreport);
     atomic_set(&ts->irq_enable,0);
 
 	ts->is_suspended = 0;
-	atomic_set(&ts->is_stop,0);
     spin_lock_init(&ts->lock);
 	/*****power_end*********/
 	if( !i2c_check_functionality(client->adapter, I2C_FUNC_I2C) ){
@@ -4104,6 +4091,7 @@ static int synaptics_ts_probe(struct i2c_client *client, const struct i2c_device
 		ret = -ENOMEM;
 		goto exit_createworkqueue_failed;
 	}
+	INIT_DELAYED_WORK(&ts->speed_up_work,speedup_synaptics_resume);
 
 	get_base_report = create_singlethread_workqueue("get_base_report");
 	if( !get_base_report ){
@@ -4275,20 +4263,31 @@ static int synaptics_ts_remove(struct i2c_client *client)
 	return 0;
 }
 
-static int synaptics_i2c_suspend(struct device *dev)
+static int synaptics_ts_suspend(struct device *dev)
 {
+	int ret,i;
 	struct synaptics_ts_data *ts = dev_get_drvdata(dev);
 
-	spin_lock_irqsave(&ts->isr_lock, flags);
-	ts->i2c_awake = false;
-	spin_unlock_irqrestore(&ts->isr_lock, flags);
+	if(ts->input_dev == NULL) {
+		ret = -ENOMEM;
+		TPD_ERR("input_dev  registration is not complete\n");
+		return -1;
+	}
+	TPD_DEBUG("%s enter\n", __func__);
+	for (i = 0; i < ts->max_num; i++)
+	{
+		input_mt_slot(ts->input_dev, i);
+		input_mt_report_slot_state(ts->input_dev, MT_TOOL_FINGER, 0);
+	}
+	input_report_key(ts->input_dev, BTN_TOOL_FINGER, 0);
+	input_sync(ts->input_dev);
 
-	if (ts->gesture_enable)
-		enable_irq_wake(ts->irq);
+#ifndef TPD_USE_EINT
+	hrtimer_cancel(&ts->timer);
+#endif
 
 #ifdef SUPPORT_GESTURE
 	if( ts->gesture_enable ){
-		atomic_set(&ts->is_stop,0);
 		if (mutex_trylock(&ts->mutex)){
 			touch_enable(ts);
 			synaptics_enable_interrupt_for_gesture(ts, 1);
@@ -4301,20 +4300,105 @@ static int synaptics_i2c_suspend(struct device *dev)
 	return 0;
 }
 
+static void speedup_synaptics_resume(struct work_struct *work)
+{
+	int ret;
+	struct synaptics_ts_data *ts = ts_g;
+
+//#ifdef SUPPORT_SLEEP_POWEROFF
+	//TPD_DEBUG("%s enter!\n", __func__);
+    if (ts->support_hw_poweroff){
+        if(0 == ts->gesture_enable){
+			if (ts->pinctrl) {
+				ret = pinctrl_select_state(ts->pinctrl, ts->pinctrl_state_active);
+			}
+            ret = tpd_power(ts,1);
+            if (ret < 0)
+                TPD_ERR("%s power on err\n",__func__);
+        }
+    }
+	//TPD_DEBUG("%s end!\n", __func__);
+//#endif
+}
+
+static int synaptics_ts_resume(struct device *dev)
+{
+	int ret;
+	struct synaptics_ts_data *ts = dev_get_drvdata(dev);
+	int i;
+
+	TPD_DEBUG("%s enter!\n", __func__);
+
+	if(ts->loading_fw) {
+		TPD_ERR("%s FW is updating break!\n",__func__);
+		return -1;
+	}
+
+	if(ts->input_dev == NULL) {
+		ret = -ENOMEM;
+		TPD_ERR("input_dev  registration is not complete\n");
+		goto ERR_RESUME;
+	}
+	for (i = 0; i < ts->max_num; i++)
+	{
+		input_mt_slot(ts->input_dev, i);
+		input_mt_report_slot_state(ts->input_dev, MT_TOOL_FINGER, 1);
+		input_mt_slot(ts->input_dev, i);
+		input_mt_report_slot_state(ts->input_dev, MT_TOOL_FINGER, 0);
+	}
+	input_report_key(ts->input_dev, BTN_TOOL_FINGER, 0);
+	input_sync(ts->input_dev);
+
+    //touch_enable(ts);
+
+	TPD_DEBUG("%s:normal end!\n", __func__);
+ERR_RESUME:
+	return 0;
+}
+
+static int synaptics_i2c_suspend(struct device *dev)
+{
+	int ret;
+	struct synaptics_ts_data *ts = dev_get_drvdata(dev);
+
+	TPD_DEBUG("%s: is called\n", __func__);
+	if (ts->gesture_enable == 1){
+		/*enable gpio wake system through intterrupt*/
+		enable_irq_wake(ts->irq);
+	}
+//#ifdef SUPPORT_SLEEP_POWEROFF
+	if(ts->loading_fw) {
+		TPD_ERR("FW is updating while suspending");
+		return -1;
+	}
+    if(ts->support_hw_poweroff && (ts->gesture_enable == 0)){
+		atomic_set(&ts->is_stop,1);
+		touch_disable(ts);
+	    ret = tpd_power(ts,0);
+	    if (ret < 0)
+	        TPD_ERR("%s power off err\n",__func__);
+		if (ts->pinctrl){
+			ret = pinctrl_select_state(ts->pinctrl,
+					ts->pinctrl_state_suspend);
+		}
+	}
+//#endif
+	return 0;
+}
+
 static int synaptics_i2c_resume(struct device *dev)
 {
 	struct synaptics_ts_data *ts = dev_get_drvdata(dev);
-	unsigned long flags;
-
-	spin_lock_irqsave(&ts->isr_lock, flags);
-	ts->i2c_awake = true;
-	spin_unlock_irqrestore(&ts->isr_lock, flags);
-
-	complete(&ts->i2c_resume);
-
-	if (ts->gesture_enable)
+	int ret;
+	TPD_DEBUG("%s is called\n", __func__);
+    queue_delayed_work(synaptics_wq,&ts->speed_up_work, msecs_to_jiffies(5));
+	if (ts->gesture_enable == 1){
+		/*disable gpio wake system through intterrupt*/
 		disable_irq_wake(ts->irq);
-
+		synaptics_rmi4_i2c_write_byte(ts->client, 0xff, 0x00 );
+		ret = synaptics_rmi4_i2c_read_word(ts->client, F01_RMI_DATA_BASE);
+		TPD_ERR("%s check status:0x%x\n", __func__,ret&0xffff);
+	}
 	return 0;
 }
 
@@ -4351,16 +4435,14 @@ static int fb_notifier_callback(struct notifier_block *self, unsigned long event
 	case FB_BLANK_UNBLANK:
 	case FB_BLANK_VSYNC_SUSPEND:
 	case FB_BLANK_NORMAL:
-		if (ts->screen_off) {
-			cancel_work_sync(&ts->pm_work);
-			ts->screen_off = 0;
+		if (ts->is_suspended) {
+			ts->is_suspended = 0;
 			queue_work(system_highpri_wq, &ts->pm_work);
 		}
 		break;
 	case FB_BLANK_POWERDOWN:
-		if (!ts->screen_off) {
-			cancel_work_sync(&ts->pm_work);
-			ts->screen_off = 1;
+		if (!ts->is_suspended) {
+			ts->is_suspended = 1;
 			queue_work(system_highpri_wq, &ts->pm_work);
 		}
 		break;
